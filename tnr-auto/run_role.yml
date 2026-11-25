@@ -1,0 +1,31 @@
+---
+# Exécute un rôle de test en isolant ses erreurs : si le rôle plante, les cas
+# de ce rôle sans résultat sont consignés en ERROR et l'exécution continue.
+# Variable d'entrée : test_role (nom du rôle)
+- name: "Exécuter le rôle {{ test_role }}"
+  block:
+    - name: "Rôle {{ test_role }}"
+      ansible.builtin.include_role:
+        name: "{{ test_role }}"
+  rescue:
+    - name: "Consigner en ERROR les cas non enregistrés de {{ test_role }}"
+      ansible.builtin.include_role:
+        name: test_framework
+        tasks_from: record_result
+      vars:
+        _recorded_ids: "{{ regression_results | default([]) | map(attribute='case_id') | list }}"
+        test_case_id: "{{ item.id }}"
+        test_squash_ref: "{{ item.squash_ref | default('') }}"
+        test_name: "{{ item.title }}"
+        test_severity: "{{ item.severity | default('normal') }}"
+        test_status: ERROR
+        test_message: >-
+          Le rôle {{ test_role }} a échoué :
+          {{ ansible_failed_result.msg | default('erreur inattendue') }}
+      loop: >-
+        {{ regression_selected_cases
+           | selectattr('role', 'equalto', test_role)
+           | rejectattr('id', 'in', _recorded_ids)
+           | list }}
+      loop_control:
+        label: "{{ item.id }}"

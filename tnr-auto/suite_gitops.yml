@@ -1,0 +1,21 @@
+---
+# =============================================================================
+# suite_gitops.yml - suite de non-régression "conformité GitOps"
+#
+# Enveloppe fine autour de run_suite.yml : fixe la suite et porte les
+# paramètres propres à ce domaine (lus par les rôles tagués "gitops").
+# Les extra_vars (AAP/CLI) restent prioritaires sur ces valeurs par défaut.
+#
+# Exemples :
+#   ansible-playbook -i inventories/dev playbooks/suite_gitops.yml \
+#     -e target_env=dev -e regression_k8s_token=$TOKEN
+#   ... -e case_id=OCP-GITOPS-001 --limit cluster-dev-01
+# =============================================================================
+- name: Suite GitOps
+  ansible.builtin.import_playbook: run_suite.yml
+  vars:
+    suite: gitops
+    gitops_namespace: openshift-gitops
+    gitops_sync_timeout_s: 300          # attente max d'un état Synced/Healthy
+    gitops_excluded_apps: []            # Applications ignorées (noms exacts)
+    gitops_expected_health: Healthy

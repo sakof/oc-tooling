@@ -1,0 +1,242 @@
+---
+# =============================================================================
+# run_suite.yml - point d'entrée générique des tests de non-régression
+#
+# Variables d'entrée (extra_vars en CLI, ou survey d'un Job Template AAP) :
+#   target_env         (obligatoire) dev | preprod | prod
+#   suite              smoke (défaut) | gitops | full
+#   case_id            un ou plusieurs ID de cas, séparés par des virgules
+#                      (prioritaire sur suite et case_tags)
+#   case_tags          tags séparés par des virgules (remplace ceux de la suite)
+#   run_active         false (défaut) ; true pour inclure les cas mode: active
+#   allow_active_prod  false (défaut) ; garde-fou pour les cas actifs en prod
+#   fail_fast          false (défaut) ; true = arrêt d'un cluster au 1er échec
+#   regression_fail_on_severities   [critical] (défaut) ; sévérités bloquantes
+#
+# Les clusters ciblés = groupe d'inventaire "env_<target_env>" (restreint par
+# le "limit" AAP / --limit). Variables d'inventaire attendues par cluster :
+#   cluster_api_url, cluster_validate_certs (optionnel)
+# Le token vient d'un credential AAP injecté en extra_var : regression_k8s_token
+#
+# Contrat avec le rôle test_framework :
+#   record_result   (variables test_case_id, test_status, ...)
+#   publish_report  (lit regression_all_results, regression_suite, target_env,
+#                    regression_report_dir ; écrit results.json et junit.xml)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Play 1 : validation des entrées et sélection des cas dans le catalogue
+# -----------------------------------------------------------------------------
+- name: "Préparation - sélection des cas à exécuter"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _suites:                 # suite -> tags du catalogue ([] = aucun filtre)
+      smoke: [smoke]
+      gitops: [gitops]
+      full: []
+    _env: "{{ target_env | default('') }}"
+    _suite: "{{ suite | default('smoke') }}"
+    _case_ids: >-
+      {{ (case_id | default('') | string).split(',')
+         | map('trim') | reject('equalto', '') | list }}
+    _tags_cli: >-
+      {{ (case_tags | default('') | string).split(',')
+         | map('trim') | reject('equalto', '') | list }}
+    _tags: "{{ _tags_cli if _tags_cli | length > 0 else _suites[_suite] | default([]) }}"
+  tasks:
+    - name: Valider les paramètres d'entrée
+      ansible.builtin.assert:
+        that:
+          - _env in ['dev', 'preprod', 'prod']
+          - _suite in _suites
+          - ('env_' ~ _env) in groups
+          - groups['env_' ~ _env] | length > 0
+        fail_msg: >-
+          Paramètres invalides : target_env='{{ _env }}' (dev|preprod|prod),
+          suite='{{ _suite }}' ({{ _suites.keys() | list | join('|') }}),
+          ou groupe d'inventaire env_{{ _env }} absent ou vide.
+        quiet: true
+
+    - name: Charger le catalogue des cas
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../tests/catalog/cases.yml"
+        name: regression_catalog
+
+    - name: Initialiser la sélection
+      ansible.builtin.set_fact:
+        _selected: []
+
+    - name: Sélectionner les cas applicables
+      ansible.builtin.set_fact:
+        _selected: "{{ _selected + [item] }}"
+      loop: "{{ regression_catalog.cases }}"
+      loop_control:
+        label: "{{ item.id }}"
+      when:
+        - _env in item.environments
+        - >-
+          (_case_ids | length > 0 and item.id in _case_ids)
+          or (_case_ids | length == 0
+              and (_tags | length == 0
+                   or (item.tags | default([]) | intersect(_tags) | length) > 0)
+              and (item.mode | default('readonly') == 'readonly'
+                   or run_active | default(false) | bool))
+
+    - name: Vérifier la cohérence de la sélection
+      ansible.builtin.assert:
+        that:
+          - _selected | length > 0
+          - (_case_ids | difference(_selected | map(attribute='id') | list)) | length == 0
+          - >-
+            _env != 'prod' or allow_active_prod | default(false) | bool
+            or (_selected | map(attribute='mode', default='readonly')
+                | select('equalto', 'active') | list | length == 0)
+        fail_msg: >-
+          Sélection invalide : aucun cas retenu, case_id inconnu(s) ou non
+          applicable(s) à {{ _env }}, ou cas actifs refusés en prod
+          (allow_active_prod=true pour forcer).
+        quiet: true
+
+    - name: Publier la sélection pour les plays suivants
+      ansible.builtin.set_fact:
+        regression_suite: "{{ _suite }}"
+        regression_selected_cases: "{{ _selected }}"
+
+    - name: Afficher les cas retenus
+      ansible.builtin.debug:
+        msg: "{{ _selected | length }} cas : {{ _selected | map(attribute='id') | join(', ') }}"
+
+# -----------------------------------------------------------------------------
+# Play 2 : exécution sur chaque cluster (lecture seule, un hôte = un cluster)
+# -----------------------------------------------------------------------------
+- name: "Exécution des tests sur les clusters"
+  hosts: "env_{{ target_env }}"
+  connection: local
+  gather_facts: false
+  module_defaults:
+    # Authentification de tous les modules kubernetes.core.k8s*
+    group/kubernetes.core.k8s:
+      host: "{{ cluster_api_url }}"
+      api_key: "{{ regression_k8s_token }}"
+      validate_certs: "{{ cluster_validate_certs | default(true) }}"
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    regression_suite: "{{ hostvars['localhost']['regression_suite'] }}"
+    regression_selected_cases: "{{ hostvars['localhost']['regression_selected_cases'] }}"
+    # fail_fast : vrai dès qu'un résultat FAILED ou ERROR existe sur ce cluster
+    regression_stopped: >-
+      {{ (fail_fast | default(false) | bool)
+         and (regression_results | default([])
+              | selectattr('status', 'in', ['FAILED', 'ERROR']) | list | length > 0) }}
+  tasks:
+    - name: Initialiser les résultats du cluster
+      ansible.builtin.set_fact:
+        regression_results: []
+
+    - name: Exécuter les rôles de test sélectionnés
+      ansible.builtin.include_tasks: tasks/run_role.yml
+      loop: "{{ regression_selected_cases | map(attribute='role') | unique | list }}"
+      loop_control:
+        loop_var: test_role
+      when: not (regression_stopped | bool)
+
+    - name: Mémoriser si l'exécution a été interrompue par fail_fast
+      ansible.builtin.set_fact:
+        _stopped: "{{ regression_stopped | bool }}"
+
+    # Garde-fou : un cas sélectionné doit toujours produire un résultat.
+    - name: Consigner les cas sans résultat (SKIPPED si fail_fast, sinon ERROR)
+      ansible.builtin.include_role:
+        name: test_framework
+        tasks_from: record_result
+      vars:
+        test_case_id: "{{ item.id }}"
+        test_squash_ref: "{{ item.squash_ref | default('') }}"
+        test_name: "{{ item.title }}"
+        test_severity: "{{ item.severity | default('normal') }}"
+        test_status: "{{ 'SKIPPED' if _stopped else 'ERROR' }}"
+        test_message: >-
+          {{ 'Non exécuté (fail_fast après un échec)' if _stopped
+             else 'Aucun résultat enregistré par le rôle ' ~ item.role }}
+      loop: >-
+        {{ regression_selected_cases
+           | rejectattr('id', 'in', regression_results | map(attribute='case_id') | list)
+           | list }}
+      loop_control:
+        label: "{{ item.id }}"
+
+# -----------------------------------------------------------------------------
+# Play 3 : consolidation, rapports, artefacts AAP et statut du job
+# -----------------------------------------------------------------------------
+- name: "Consolidation - rapports et statut du job"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    regression_fail_on_severities: [critical]
+    regression_report_dir: >-
+      /tmp/regression/{{ target_env }}/{{ now(fmt='%Y%m%d') }}/{{ awx_job_id | default(tower_job_id | default('manual')) }}
+    _errors: "{{ regression_all_results | selectattr('status', 'equalto', 'ERROR') | list }}"
+    _failed_blocking: >-
+      {{ regression_all_results | selectattr('status', 'equalto', 'FAILED')
+         | selectattr('severity', 'in', regression_fail_on_severities) | list }}
+    regression_blocking: "{{ _errors + _failed_blocking }}"
+  tasks:
+    - name: Agréger les résultats de tous les clusters
+      ansible.builtin.set_fact:
+        regression_all_results: >-
+          {{ regression_all_results | default([])
+             + (hostvars[item].regression_results | default([])) }}
+      loop: "{{ groups['env_' ~ target_env] }}"
+
+    - name: Vérifier qu'au moins un résultat a été produit
+      ansible.builtin.assert:
+        that: regression_all_results | default([]) | length > 0
+        fail_msg: "Aucun résultat produit (inventaire vide ou limit trop restrictif ?)"
+        quiet: true
+
+    - name: Calculer le bilan
+      ansible.builtin.set_fact:
+        regression_summary:
+          suite: "{{ regression_suite }}"
+          env: "{{ target_env }}"
+          clusters: "{{ regression_all_results | map(attribute='cluster') | unique | list }}"
+          total: "{{ regression_all_results | length }}"
+          passed: "{{ regression_all_results | selectattr('status', 'equalto', 'PASSED') | list | length }}"
+          failed: "{{ regression_all_results | selectattr('status', 'equalto', 'FAILED') | list | length }}"
+          error: "{{ _errors | length }}"
+          skipped: "{{ regression_all_results | selectattr('status', 'equalto', 'SKIPPED') | list | length }}"
+          blocking_cases: "{{ regression_blocking | map(attribute='case_id') | unique | list }}"
+          report_dir: "{{ regression_report_dir }}"
+
+    - name: Générer et publier results.json / junit.xml
+      ansible.builtin.include_role:
+        name: test_framework
+        tasks_from: publish_report
+
+    - name: Exposer le bilan en artefact du job AAP
+      ansible.builtin.set_stats:
+        data:
+          regression_summary: "{{ regression_summary }}"
+        per_host: false
+
+    - name: Afficher le bilan
+      ansible.builtin.debug:
+        var: regression_summary
+
+    - name: Afficher les cas non réussis
+      ansible.builtin.debug:
+        msg: "[{{ item.status }}] {{ item.case_id }} @ {{ item.cluster }} - {{ item.message }}"
+      loop: "{{ regression_all_results | rejectattr('status', 'equalto', 'PASSED') | list }}"
+      loop_control:
+        label: "{{ item.case_id }}@{{ item.cluster }}"
+
+    # Les rapports sont déjà générés : on peut faire échouer le job sans perte.
+    - name: Faire échouer le job en cas de régression bloquante
+      ansible.builtin.fail:
+        msg: >-
+          Régression bloquante : {{ regression_summary.blocking_cases | join(', ') }}
+          (ERROR ou FAILED de sévérité {{ regression_fail_on_severities | join('/') }})
+      when: regression_blocking | length > 0
